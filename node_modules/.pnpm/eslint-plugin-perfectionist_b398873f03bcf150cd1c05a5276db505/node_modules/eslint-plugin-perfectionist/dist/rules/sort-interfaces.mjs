@@ -1,0 +1,253 @@
+import { minimatch } from "minimatch";
+import { OptionalityOrder, SortType, SortOrder } from "../typings/index.mjs";
+import { createEslintRule } from "../utils/create-eslint-rule.mjs";
+import { isMemberOptional } from "../utils/is-member-optional.mjs";
+import { getLinesBetween } from "../utils/get-lines-between.mjs";
+import { getGroupNumber } from "../utils/get-group-number.mjs";
+import { toSingleLine } from "../utils/to-single-line.mjs";
+import { rangeToDiff } from "../utils/range-to-diff.mjs";
+import { isPositive } from "../utils/is-positive.mjs";
+import { useGroups } from "../utils/use-groups.mjs";
+import { sortNodes } from "../utils/sort-nodes.mjs";
+import { makeFixes } from "../utils/make-fixes.mjs";
+import { complete } from "../utils/complete.mjs";
+import { pairwise } from "../utils/pairwise.mjs";
+import { compare } from "../utils/compare.mjs";
+const RULE_NAME = "sort-interfaces";
+const sortInterfaces = createEslintRule({
+  name: RULE_NAME,
+  meta: {
+    type: "suggestion",
+    docs: {
+      description: "enforce sorted interface properties"
+    },
+    fixable: "code",
+    schema: [
+      {
+        type: "object",
+        properties: {
+          "custom-groups": {
+            type: "object"
+          },
+          "optionality-order": {
+            enum: [
+              OptionalityOrder.ignore,
+              OptionalityOrder["optional-first"],
+              OptionalityOrder["required-first"]
+            ],
+            default: OptionalityOrder.ignore,
+            type: "string"
+          },
+          type: {
+            enum: [
+              SortType.alphabetical,
+              SortType.natural,
+              SortType["line-length"]
+            ],
+            default: SortType.alphabetical,
+            type: "string"
+          },
+          order: {
+            enum: [SortOrder.asc, SortOrder.desc],
+            default: SortOrder.asc,
+            type: "string"
+          },
+          "ignore-case": {
+            type: "boolean",
+            default: false
+          },
+          "ignore-pattern": {
+            items: {
+              type: "string"
+            },
+            type: "array"
+          },
+          groups: {
+            type: "array",
+            default: []
+          },
+          "partition-by-new-line": {
+            type: "boolean",
+            default: false
+          }
+        },
+        additionalProperties: false
+      }
+    ],
+    messages: {
+      unexpectedInterfacePropertiesOrder: 'Expected "{{right}}" to come before "{{left}}"'
+    }
+  },
+  defaultOptions: [
+    {
+      type: SortType.alphabetical,
+      order: SortOrder.asc
+    }
+  ],
+  create: (context) => ({
+    TSInterfaceDeclaration: (node) => {
+      if (node.body.body.length > 1) {
+        let options = complete(context.options.at(0), {
+          "optionality-order": OptionalityOrder.ignore,
+          "partition-by-new-line": false,
+          type: SortType.alphabetical,
+          "ignore-case": false,
+          order: SortOrder.asc,
+          "ignore-pattern": [],
+          "custom-groups": {},
+          groups: []
+        });
+        if (!options["ignore-pattern"].some(
+          (pattern) => minimatch(node.id.name, pattern, {
+            nocomment: true
+          })
+        )) {
+          let formattedMembers = node.body.body.reduce(
+            (accumulator, element) => {
+              var _a, _b, _c, _d;
+              if (element.type === "TSCallSignatureDeclaration") {
+                accumulator.push([]);
+                return accumulator;
+              }
+              let lastElement = (_a = accumulator.at(-1)) == null ? void 0 : _a.at(-1);
+              let name;
+              let { getGroup, defineGroup, setCustomGroups } = useGroups(
+                options.groups
+              );
+              if (element.type === "TSPropertySignature") {
+                if (element.key.type === "Identifier") {
+                  ({ name } = element.key);
+                } else if (element.key.type === "Literal") {
+                  name = `${element.key.value}`;
+                } else {
+                  let end = ((_b = element.typeAnnotation) == null ? void 0 : _b.range.at(0)) ?? element.range.at(1) - (element.optional ? "?".length : 0);
+                  name = context.sourceCode.text.slice(element.range.at(0), end);
+                }
+              } else if (element.type === "TSIndexSignature") {
+                let endIndex = ((_c = element.typeAnnotation) == null ? void 0 : _c.range.at(0)) ?? element.range.at(1);
+                name = context.sourceCode.text.slice(
+                  element.range.at(0),
+                  endIndex
+                );
+              } else {
+                let endIndex = ((_d = element.returnType) == null ? void 0 : _d.range.at(0)) ?? element.range.at(1);
+                name = context.sourceCode.text.slice(
+                  element.range.at(0),
+                  endIndex
+                );
+              }
+              let elementSortingNode = {
+                size: rangeToDiff(element.range),
+                node: element,
+                name
+              };
+              if (options["partition-by-new-line"] && lastElement && getLinesBetween(
+                context.sourceCode,
+                lastElement,
+                elementSortingNode
+              )) {
+                accumulator.push([]);
+              }
+              setCustomGroups(options["custom-groups"], name);
+              if (element.loc.start.line !== element.loc.end.line) {
+                defineGroup("multiline");
+              }
+              accumulator.at(-1).push({
+                ...elementSortingNode,
+                group: getGroup()
+              });
+              return accumulator;
+            },
+            [[]]
+          );
+          let toSorted = (nodes) => {
+            let grouped = {};
+            for (let currentNode of nodes) {
+              let groupNum = getGroupNumber(options.groups, currentNode);
+              if (!(groupNum in grouped)) {
+                grouped[groupNum] = [currentNode];
+              } else {
+                grouped[groupNum] = sortNodes(
+                  [...grouped[groupNum], currentNode],
+                  options
+                );
+              }
+            }
+            let sortedNodes = [];
+            for (let group of Object.keys(grouped).sort(
+              (a, b) => Number(a) - Number(b)
+            )) {
+              sortedNodes.push(...sortNodes(grouped[group], options));
+            }
+            return sortedNodes;
+          };
+          let checkGroupSort = (left, right) => {
+            let leftNum = getGroupNumber(options.groups, left);
+            let rightNum = getGroupNumber(options.groups, right);
+            return leftNum > rightNum || leftNum === rightNum && isPositive(compare(left, right, options));
+          };
+          let optionalityOrder = options["optionality-order"];
+          let checkOrder = (members, left, right, iteration) => {
+            if (optionalityOrder === OptionalityOrder.ignore) {
+              return checkGroupSort(left, right);
+            }
+            let switchIndex = members.findIndex(
+              (_, i) => i && isMemberOptional(members[i - 1].node) !== isMemberOptional(members[i].node)
+            );
+            if (iteration < switchIndex && iteration + 1 !== switchIndex) {
+              return checkGroupSort(left, right);
+            }
+            if (isMemberOptional(left.node) !== isMemberOptional(right.node)) {
+              return isMemberOptional(left.node) !== (optionalityOrder === OptionalityOrder["optional-first"]);
+            }
+            return checkGroupSort(left, right);
+          };
+          for (let nodes of formattedMembers) {
+            pairwise(nodes, (left, right, iteration) => {
+              if (checkOrder(nodes, left, right, iteration)) {
+                context.report({
+                  messageId: "unexpectedInterfacePropertiesOrder",
+                  data: {
+                    left: toSingleLine(left.name),
+                    right: toSingleLine(right.name)
+                  },
+                  node: right.node,
+                  fix: (fixer) => {
+                    let sortedNodes;
+                    if (optionalityOrder !== OptionalityOrder.ignore) {
+                      let optionalNodes = nodes.filter(
+                        (member) => isMemberOptional(member.node)
+                      );
+                      let requiredNodes = nodes.filter(
+                        (member) => !isMemberOptional(member.node)
+                      );
+                      sortedNodes = optionalityOrder === OptionalityOrder["optional-first"] ? [
+                        ...toSorted(optionalNodes),
+                        ...toSorted(requiredNodes)
+                      ] : [
+                        ...toSorted(requiredNodes),
+                        ...toSorted(optionalNodes)
+                      ];
+                    } else {
+                      sortedNodes = toSorted(nodes);
+                    }
+                    return makeFixes(
+                      fixer,
+                      nodes,
+                      sortedNodes,
+                      context.sourceCode
+                    );
+                  }
+                });
+              }
+            });
+          }
+        }
+      }
+    }
+  })
+});
+export {
+  RULE_NAME,
+  sortInterfaces as default
+};
